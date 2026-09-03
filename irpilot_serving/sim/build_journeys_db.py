@@ -63,7 +63,7 @@ _OBS_AS_OF = """(
         SELECT train_number, train_date, serial_number,
                max(actual_arrival_time)   AS actual_arrival_time,
                max(actual_departure_time) AS actual_departure_time
-          FROM feed_chunk
+          FROM {feed_chunk}
          WHERE reveal_time <= %s
          GROUP BY train_number, train_date, serial_number
       ) o"""
@@ -86,7 +86,10 @@ def read_running_from_db(conn, trains=None, as_of=None) -> pd.DataFrame:
     """
     sql, args = _QUERY, []
     if as_of is not None:
-        sql = sql.replace("LEFT JOIN observation o", "LEFT JOIN " + _OBS_AS_OF)
+        sql = sql.replace(
+            "LEFT JOIN observation o",
+            "LEFT JOIN " + _OBS_AS_OF.format(
+                feed_chunk=config.NAMES["feed_chunk"]))
         args.append(as_of)          # first %s in the text, so first in the tuple
     if trains:
         # BOTH SIDES MUST BE FILTERED. Filtering only `schedule` leaves the

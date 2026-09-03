@@ -119,6 +119,9 @@ _SIM_NAMES = {
     "tsr":            "tsr",
     "coaches":        "coaches",
     "pf_info":        "pf_info",
+    # Replay only: the reported-at log. No production counterpart — live, the
+    # observation table IS the present and there is nothing to reveal.
+    "feed_chunk":     "feed_chunk",
     # column expressions
     "train_date":     "train_date",
     "changed_at":     "changed_at",
@@ -140,6 +143,7 @@ _PROD_NAMES = {
     # and we keep answering with last July's value. The CSVs stay as fallback.
     "coaches":        "test.coaches",
     "pf_info":        "test.pf_info",
+    "feed_chunk":     "feed_chunk",      # replay only; absent in production
 
     # train_date is DATE there and text here; ::text gives 'YYYY-MM-DD',
     # which is the format build_journey expects.
@@ -159,6 +163,31 @@ _PROD_NAMES = {
     "tsr_to":         "todatetime::timestamp",
 }
 
+# ── Where WE are allowed to write ────────────────────────────────────────────
+# Their database splits read from write: `test` holds the feeds and is
+# read-only to us, `data` is where we may create things. Our four tables and
+# two views must therefore be schema-qualified, or they land wherever
+# search_path happens to point — `public` if we are lucky, a permission error
+# if we are not, and worst of all a table in the wrong schema that everything
+# then silently reads from.
+#
+# Empty means "use search_path", which is right for a single-schema database
+# like the simulation one.
+WRITE_SCHEMA = os.getenv("IRPILOT_WRITE_SCHEMA", "").strip().strip(".")
+
+
+def out(name: str) -> str:
+    """Qualify one of OUR objects with the write schema."""
+    return f"{WRITE_SCHEMA}.{name}" if WRITE_SCHEMA else name
+
+
+# Every object we create or write. Named here so there is one list to audit
+# against a permissions grant, and one place to change if a name collides.
+OUT = {n: out(n) for n in (
+    "forecast", "model_state", "infra_topology", "station_ref",
+    "forecast_read", "forecast_latest",
+)}
+
 SCHEMA = os.getenv("IRPILOT_SCHEMA", "sim")
 if SCHEMA not in ("sim", "prod"):
     raise SystemExit(f"IRPILOT_SCHEMA must be 'sim' or 'prod', got {SCHEMA!r}")
@@ -176,7 +205,10 @@ for _k in list(NAMES):
 
 # ── Simulation clock ──────────────────────────────────────────────────────────
 TICK_MIN = 3          # model cadence, matches build_dataset.SNAPSHOT_SCHEDULE
-FEED_MIN = 5          # CRIS delta cadence
+# How often to ask the database what is new. 5 matches how often CRIS delivers.
+# Env-driven so a slower feed can be matched without a code change, and so the
+# cost of a late feed can be measured rather than assumed.
+FEED_MIN = int(os.getenv("IRPILOT_FEED_MIN", "5"))
 
 # How far BEFORE the last read to look again, every window.
 #

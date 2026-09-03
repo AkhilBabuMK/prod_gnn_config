@@ -41,7 +41,7 @@ import psycopg2
 import config
 
 DDL = """
-CREATE TABLE IF NOT EXISTS model_state (
+CREATE TABLE IF NOT EXISTS {model_state} (
     tick_ts        TIMESTAMPTZ PRIMARY KEY,
     station_memory BYTEA NOT NULL,
     service_memory BYTEA NOT NULL,
@@ -51,9 +51,9 @@ CREATE TABLE IF NOT EXISTS model_state (
     checkpoint_sha TEXT  NOT NULL,
     created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE INDEX IF NOT EXISTS ix_model_state_created ON model_state (created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_model_state_created ON {model_state} (created_at DESC);
 
-CREATE TABLE IF NOT EXISTS forecast (
+CREATE TABLE IF NOT EXISTS {forecast} (
     issued_at      TIMESTAMPTZ NOT NULL,
     instance_id    TEXT        NOT NULL,
     station_id     INTEGER     NOT NULL,
@@ -65,15 +65,15 @@ CREATE TABLE IF NOT EXISTS forecast (
     model_version  TEXT,
     PRIMARY KEY (issued_at, instance_id, station_id)
 );
-CREATE INDEX IF NOT EXISTS ix_forecast_issued ON forecast (issued_at DESC);
+CREATE INDEX IF NOT EXISTS ix_forecast_issued ON {forecast} (issued_at DESC);
 
-CREATE TABLE IF NOT EXISTS infra_topology (
+CREATE TABLE IF NOT EXISTS {infra_topology} (
     version   TEXT PRIMARY KEY,
     topology  JSONB NOT NULL,
     loaded_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS station_ref (
+CREATE TABLE IF NOT EXISTS {station_ref} (
     station_id    INTEGER PRIMARY KEY,
     station_code  VARCHAR(12) NOT NULL,
     station_name  TEXT,
@@ -85,10 +85,10 @@ VIEWS = """
 -- Dropped first, not CREATE OR REPLACE: replace cannot rename or reorder the
 -- columns of an existing view, so an older definition would block the new one.
 -- These two views are ours and hold no data, so dropping costs nothing.
-DROP VIEW IF EXISTS forecast_latest;
-DROP VIEW IF EXISTS forecast_read;
+DROP VIEW IF EXISTS {forecast_latest};
+DROP VIEW IF EXISTS {forecast_read};
 
-CREATE VIEW forecast_read AS
+CREATE VIEW {forecast_read} AS
 SELECT f.issued_at,
        f.instance_id,
        split_part(f.instance_id, '_', 1)                AS train_number,
@@ -102,12 +102,12 @@ SELECT f.issued_at,
        -- past the moment we expect it and has not reported.
        (f.lead_min < 0)                                 AS is_overdue,
        f.lo80, f.hi80, f.model_version
-  FROM forecast f
-  LEFT JOIN station_ref r ON r.station_id = f.station_id;
+  FROM {forecast} f
+  LEFT JOIN {station_ref} r ON r.station_id = f.station_id;
 
-CREATE VIEW forecast_latest AS
-SELECT * FROM forecast_read
- WHERE issued_at = (SELECT max(issued_at) FROM forecast);
+CREATE VIEW {forecast_latest} AS
+SELECT * FROM {forecast_read}
+ WHERE issued_at = (SELECT max(issued_at) FROM {forecast});
 """
 
 _ok = _bad = 0
@@ -252,7 +252,7 @@ def main() -> int:
     # ── ours ────────────────────────────────────────────────────────────────
     print("\nOUR OBJECTS")
     with conn.cursor() as cur:
-        cur.execute(DDL)
+        cur.execute(DDL.format(**config.OUT))
     check("tables created",
           lambda: "model_state, forecast, infra_topology, station_ref")
 
@@ -260,13 +260,14 @@ def main() -> int:
         topo = json.loads(Path(config.TOPOLOGY).read_text(encoding="utf-8"))
         version = str(topo.get("meta", {}).get("version", "v1"))
         with conn.cursor() as cur:
-            cur.execute("DELETE FROM infra_topology WHERE version = %s",
+            cur.execute(f"DELETE FROM {config.OUT['infra_topology']} WHERE version = %s",
                         (version,))
-            cur.execute("INSERT INTO infra_topology (version, topology) "
-                        "VALUES (%s, %s)", (version, json.dumps(topo)))
-            cur.execute("DELETE FROM station_ref")
+            cur.execute(f"INSERT INTO {config.OUT['infra_topology']} "
+                        f"(version, topology) VALUES (%s, %s)",
+                        (version, json.dumps(topo)))
+            cur.execute(f"DELETE FROM {config.OUT['station_ref']}")
             for s in topo["stations"].values():
-                cur.execute("""INSERT INTO station_ref
+                cur.execute(f"""INSERT INTO {config.OUT['station_ref']}
                                  (station_id, station_code, station_name,
                                   is_junction)
                                VALUES (%s, %s, %s, %s)""",
@@ -276,7 +277,7 @@ def main() -> int:
     check("topology + station_ref loaded", t_load_topo)
 
     with conn.cursor() as cur:
-        cur.execute(VIEWS)
+        cur.execute(VIEWS.format(**config.OUT))
     check("read views created", lambda: "forecast_read, forecast_latest")
 
     conn.close()

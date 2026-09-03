@@ -332,7 +332,7 @@ class StateEngine:
               "steps": {str(k): int(v) for k, v in self.st_state.steps.items()}}
         with self.conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO model_state (tick_ts, station_memory, service_memory,
+                INSERT INTO {ms} (tick_ts, station_memory, service_memory,
                                          section_memory, station_state,
                                          prev_delay, checkpoint_sha)
                 VALUES (%s,%s,%s,%s,%s,%s,%s)
@@ -343,7 +343,8 @@ class StateEngine:
                     station_state =EXCLUDED.station_state,
                     prev_delay    =EXCLUDED.prev_delay,
                     checkpoint_sha=EXCLUDED.checkpoint_sha
-            """, (tick_ts, blob(self.model.station_memory),
+            """.format(ms=config.OUT["model_state"]),
+                (tick_ts, blob(self.model.station_memory),
                   blob(self.model.service_memory), blob(self.model.section_memory),
                   psycopg2.extras.Json(st),
                   psycopg2.extras.Json({k: float(v) for k, v in self.prev_delay.items()}),
@@ -357,7 +358,8 @@ class StateEngine:
             cur.execute("""SELECT tick_ts, station_memory, service_memory,
                                   section_memory, station_state, prev_delay,
                                   checkpoint_sha
-                             FROM model_state ORDER BY tick_ts DESC LIMIT 1""")
+                             FROM {ms} ORDER BY tick_ts DESC LIMIT 1""".format(
+                                 ms=config.OUT["model_state"]))
             r = cur.fetchone()
         if not r:
             return None
@@ -434,12 +436,12 @@ class StateEngine:
                              None, None, "v13b_ep18"))
         with self.conn.cursor() as cur:
             psycopg2.extras.execute_values(cur, """
-                INSERT INTO forecast (issued_at, instance_id, station_id, hop,
+                INSERT INTO {fc} (issued_at, instance_id, station_id, hop,
                                       lead_min, pred_delay_min, lo80, hi80,
                                       model_version)
                 VALUES %s
                 ON CONFLICT (issued_at, instance_id, station_id) DO NOTHING
-            """, recs)
+            """.format(fc=config.OUT["forecast"]), recs)
         self.conn.commit()
         self.forecasts_written += len(recs)
         return len(recs)
