@@ -267,6 +267,17 @@ def main() -> int:
     # Follow mode takes the corridor date from the data. It MUST be resolved
     # before the banner and before the lock: the lock is scoped to the corridor
     # date, and locking on None is not a lock at all.
+    # WHICH CLOCK ANSWERS "what changed?" — decided once, at boot.
+    # Comparing a real-time watermark against September event times returns
+    # nothing at all, and does it silently: the loop keeps running and simply
+    # never sees another report. So choose deliberately and say which.
+    by_event = (config.CHANGED_BY == "event")
+    if config.CHANGED_BY == "auto":
+        seen0 = newest_event(conn)
+        if seen0 is not None:
+            behind = (dt.datetime.now() - pd.Timestamp(seen0).to_pydatetime())
+            by_event = behind > dt.timedelta(days=1)
+
     if follow and date is None:
         seen = newest_event(conn)
         if seen is None:
@@ -279,10 +290,12 @@ def main() -> int:
 
     mode = ("REPLAY " + args.replay[1] + "->" + args.replay[2] if args.replay
             else "LIVE")
+    _sel = "event times" if by_event else "write time (" + config.NAMES["changed_at"] + ")"
     print("=" * 78)
     print(f"PRODUCTION LOOP   corridor date {date}   {mode}")
     print(f"  read every {config.FEED_MIN} min | tick every {config.TICK_MIN} min "
           f"| forecast every {args.forecast_every} min")
+    print(f"  what changed?  selected by {_sel}")
     print("=" * 78)
 
     if clock.replay:
@@ -357,10 +370,10 @@ def main() -> int:
 
     n = eng.rebuild_journeys(as_of=as_of(boot_now))
     ov = eng.refresh_overlays(boot_now)
-    # The read watermark is a real-world time: arrival_time is stamped by the
-    # sender's clock, so it must be compared against the wall clock even when
-    # the model is living in September.
-    last_read = pd.Timestamp(clock.now())
+    # Same rule for the first watermark as for every one after it: it has to
+    # sit on whichever clock the comparison column uses.
+    last_read = pd.Timestamp(boot_now if (clock.replay or by_event)
+                             else clock.now())
     print(f"  journeys {n} | freight {ov['legs']} legs {ov['dwells']} dwells | "
           f"blocks {ov['blocks']} failures {ov['failures']} tsr {ov['tsr']}")
     print()
@@ -433,13 +446,15 @@ def main() -> int:
             since = last_read - pd.Timedelta(
                 minutes=config.FEED_LOOKBACK_MIN / clock.accel)
             changed = changed_trains(conn, since, until=now,
-                                     by_event_time=clock.replay)
+                                     by_event_time=clock.replay or by_event)
             n_changed = len(changed)
             # Both stamped on the clock they were measured against: arrival_time
             # is real-world, so the read watermark must be real-world too.
-            # The watermark stays REAL-WORLD: arrival_time is stamped by the
-            # sender's clock, so it can only be compared against wall time.
-            last_read = pd.Timestamp(wall if follow else now)
+            # The watermark must be on the SAME clock as the column it will
+            # be compared against: model time when selecting by event, real
+            # time when selecting by write.
+            last_read = pd.Timestamp(now if (clock.replay or by_event)
+                                     else (wall if follow else now))
             last_feed = now
             if changed:
                 # Only the trains that reported need rebuilding; the rest are

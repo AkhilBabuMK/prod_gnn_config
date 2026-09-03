@@ -248,3 +248,27 @@ FEED_MIN = int(os.getenv("IRPILOT_FEED_MIN", "5"))
 # irrelevant against a 5-minute budget, and it buys tolerance for clock skew,
 # transmission delay and out-of-order batch loads.
 FEED_LOOKBACK_MIN = int(os.getenv("IRPILOT_FEED_LOOKBACK_MIN", "15"))
+
+# HOW TO ASK "WHICH TRAINS CHANGED SINCE I LAST LOOKED?"
+#
+# There are two clocks in play and they must never be compared to each other:
+#
+#   write  the REAL time a row landed in the database. Ours is `changed_at`,
+#          stamped now() by the trigger, so it is always today and always moves
+#          forward. Compared against our own last-read time — both real.
+#
+#   event  the time the train actually moved: actual_arrival_time /
+#          actual_departure_time. On a replayed September day these are 2025
+#          timestamps, and the real clock is 2026. Comparing one against the
+#          other is never true, which returns nothing, forever, in silence.
+#
+# `write` is right for a genuinely live feed. `event` is right whenever a past
+# day is being fed through in real time — the demo — and is also the only
+# option when their table has no reliable write-time column at all.
+#
+# auto: event while the data is more than a day behind the clock, write
+# otherwise. Measured at boot from the newest event in the table.
+CHANGED_BY = os.getenv("IRPILOT_CHANGED_BY", "auto").strip().lower()
+if CHANGED_BY not in ("auto", "write", "event"):
+    raise SystemExit(f"IRPILOT_CHANGED_BY must be auto, write or event, "
+                     f"got {CHANGED_BY!r}")
