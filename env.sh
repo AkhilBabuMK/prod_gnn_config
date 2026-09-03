@@ -47,9 +47,30 @@ export IRPILOT_TBL_TSR=data.temporary_speed_restriction
 export IRPILOT_TBL_COACHES=test.coaches
 export IRPILOT_TBL_PF_INFO=test.pf_info
 
-# The column on the main table that says when a row was written. We compare it
-# against wall time to ask "what is new since I last looked?".
+# The column on the main table that says when a row was written. Used to ask
+# "what is new since I last looked?" — but ONLY when comparing against real
+# time (see IRPILOT_CHANGED_BY below). Leave as-is; it is ignored entirely in
+# event mode.
 export IRPILOT_TBL_CHANGED_AT=arrival_time
+
+# ── HOW TO ASK "WHAT CHANGED?" ───────────────────────────────────────────────
+# Two clocks exist and must never be compared to each other:
+#   write  when a row LANDED in the database (arrival_time, real time)
+#   event  when the train ACTUALLY MOVED (actual_arrival_time etc, whatever
+#          day the data itself is from)
+#
+# A live feed needs `write`. Replaying or streaming a PAST day needs `event` —
+# comparing that day's dates against today's clock returns nothing, forever,
+# with no error.
+#
+#   auto   (default) decide automatically: event if the newest data in the
+#          table is more than a day behind right now, write otherwise.
+#   write  always use IRPILOT_TBL_CHANGED_AT above.
+#   event  always use the actual movement times.
+#
+# Leave on auto unless told otherwise — it is safe either way, since it never
+# mixes the two clocks.
+export IRPILOT_CHANGED_BY=auto
 
 # If the TSR guard reports windows that end before they start, the date text is
 # not ISO and needs an explicit parse:
