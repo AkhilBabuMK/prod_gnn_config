@@ -19,7 +19,7 @@ convenient version of it.
 
 Point the forecaster at it with:
 
-    IRPILOT_SCHEMA=prod IRPILOT_TBL_MAIN=demo_gnn_input_table \
+    IRPILOT_PROFILE=prod IRPILOT_TBL_MAIN=demo_gnn_input_table \
     IRPILOT_TBL_GOODS_RUNNING=goods_running \
     IRPILOT_TBL_GOODS_SCHEDULE=goods_schedule \
     IRPILOT_TBL_MAINTENANCE=maintenance \

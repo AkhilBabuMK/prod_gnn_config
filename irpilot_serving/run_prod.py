@@ -86,6 +86,8 @@ STALE_WARN_MIN = 12.0
 STALE_CRIT_MIN = 30.0
 
 _stop = False
+_CONN = None        # published so _cleanup() can close them on any exit path
+_LOCK = None
 
 
 def _on_signal(signum, frame):
@@ -247,7 +249,20 @@ def main() -> int:
         clock.t = dt.datetime.now()
         date = args.date or dt.date.today().isoformat()
 
-    conn = psycopg2.connect(**config.DB)
+    global _CONN, _LOCK
+    conn = _CONN = psycopg2.connect(**config.DB)
+    # AUTOCOMMIT, DELIBERATELY.
+    # psycopg2 opens a transaction on the first statement and holds it until a
+    # commit. Every SELECT we run therefore keeps an ACCESS SHARE lock on the
+    # tables it touched — including theirs. A TRUNCATE or an ALTER on those
+    # tables needs ACCESS EXCLUSIVE and simply waits behind us, and if this
+    # process is killed between a read and its commit the connection sits
+    # `idle in transaction` blocking them until it is terminated by hand.
+    #
+    # We never need a read to be atomic with anything else: each window is an
+    # independent snapshot, and the two writes are single statements. So commit
+    # as we go and hold nothing.
+    conn.autocommit = True
 
     # Follow mode takes the corridor date from the data. It MUST be resolved
     # before the banner and before the lock: the lock is scoped to the corridor
@@ -282,15 +297,37 @@ def main() -> int:
 
     # One writer per corridor date. On its own connection, so the lock's life is
     # the process's life and not some transaction's.
-    lock = RunLock(psycopg2.connect(**config.DB), date)
+    lock = _LOCK = RunLock(psycopg2.connect(**config.DB), date)
     if not lock.acquire():
         print()
         print(f"  REFUSING TO START: {lock.explain()}")
+        lock.release()          # closes its connection even though unheld
         conn.close()
         return 3
 
     # Replay reads through the reveal times; live reads the present as it is.
     as_of = (lambda t: t) if clock.replay else (lambda t: None)
+
+    # OUR TABLES MUST EXIST BEFORE THE LOOP STARTS.
+    # Without this the run boots, ticks once, and then dies inside the first
+    # write with a bare UndefinedTable traceback — after the model has been
+    # loaded and every journey built. Checking here costs one query and turns
+    # that into a sentence saying what to run.
+    missing = []
+    with conn.cursor() as cur:
+        for key in ("forecast", "model_state"):
+            cur.execute("SELECT to_regclass(%s)", (config.OUT[key],))
+            if cur.fetchone()[0] is None:
+                missing.append(config.OUT[key])
+    if missing:
+        print()
+        print(f"  MISSING TABLE(S): {', '.join(missing)}")
+        print("  Run this first, from this directory:")
+        print("      python setup_prod.py")
+        print("  It creates them and checks every other assumption besides.")
+        lock.release()
+        conn.close()
+        return 5
 
     eng = StateEngine(conn, date, verbose=False)
     print(f"  engine ready | checkpoint {eng.ck_sha} | {eng.ds.num_services} services")
@@ -447,10 +484,28 @@ def main() -> int:
     print("=" * 78)
     print(f"  ticks {eng.ticks} | forecast rows written this run {total:,}")
     print("=" * 78)
-    lock.release()
-    conn.close()
     return 0
 
 
+def _cleanup():
+    """Close anything this process opened, whatever happened.
+
+    Postgres has a hard connection limit, and hitting it locks EVERY client out
+    of the database, not just us. A loop that leaks two backends per run gets
+    there quickly, and the symptom lands on whoever connects next rather than
+    on us. So the connections are closed on every path — normal exit, refusal,
+    signal, or an unhandled exception.
+    """
+    for obj in (globals().get("_LOCK"), globals().get("_CONN")):
+        try:
+            if obj is not None:
+                obj.release() if hasattr(obj, "release") else obj.close()
+        except Exception:
+            pass
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    finally:
+        _cleanup()

@@ -105,8 +105,8 @@ SRC = {
 # Rather than create views in their database or fork the code, the names are
 # looked up here and substituted into the queries.
 #
-# IRPILOT_SCHEMA=sim   (default) our seeded simulation database
-# IRPILOT_SCHEMA=prod            their database, untouched
+# IRPILOT_PROFILE=sim   (default) our seeded simulation database
+# IRPILOT_PROFILE=prod            their database, untouched
 #
 # Only names appear here — never a value, never a filter. These strings are
 # interpolated into SQL, so nothing user-supplied may ever reach this dict.
@@ -188,10 +188,27 @@ OUT = {n: out(n) for n in (
     "forecast_read", "forecast_latest",
 )}
 
-SCHEMA = os.getenv("IRPILOT_SCHEMA", "sim")
-if SCHEMA not in ("sim", "prod"):
-    raise SystemExit(f"IRPILOT_SCHEMA must be 'sim' or 'prod', got {SCHEMA!r}")
-NAMES = dict(_PROD_NAMES if SCHEMA == "prod" else _SIM_NAMES)
+# Any of ours can be renamed without touching code, the same way their tables
+# can. Their forecast table is called forecast_output:
+#     IRPILOT_OUT_FORECAST=forecast_output
+# A bare name is qualified with WRITE_SCHEMA; a name containing a dot is taken
+# exactly as given, in case one object has to live somewhere else entirely.
+for _k in list(OUT):
+    _v = os.getenv("IRPILOT_OUT_" + _k.upper())
+    if _v:
+        OUT[_k] = _v if "." in _v else out(_v)
+
+# WHICH SET OF TABLE NAMES TO USE. This is NOT a Postgres schema — their
+# database has real schemas called `data` and `test`, and calling this one
+# "schema" too was a mistake worth undoing. It selects a naming profile:
+#   sim   the development database, everything unqualified
+#   prod  their database, each table qualified with the schema it lives in
+# Where WE create things is a separate setting entirely: IRPILOT_WRITE_SCHEMA.
+PROFILE = os.getenv("IRPILOT_PROFILE",
+                    os.getenv("IRPILOT_SCHEMA", "sim"))   # old name still works
+if PROFILE not in ("sim", "prod"):
+    raise SystemExit(f"IRPILOT_PROFILE must be 'sim' or 'prod', got {PROFILE!r}")
+NAMES = dict(_PROD_NAMES if PROFILE == "prod" else _SIM_NAMES)
 
 # Any single name can be overridden without touching this file, so one table
 # renamed on their side does not require a code change:

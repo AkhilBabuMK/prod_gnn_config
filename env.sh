@@ -4,9 +4,12 @@
 # Nothing else needs editing. Every environment-specific value the service
 # reads is set here.
 
-# ── which set of table names to use ──────────────────────────────────────────
-# prod = their tables. sim = the development database. There is no other value.
-export IRPILOT_SCHEMA=prod
+# ── WHICH SET OF TABLE NAMES TO USE ──────────────────────────────────────────
+# NOT a Postgres schema. This picks a naming profile:
+#   prod  your tables, each qualified with the schema it lives in (below)
+#   sim   the development database
+# Where we CREATE things is the separate IRPILOT_WRITE_SCHEMA setting.
+export IRPILOT_PROFILE=prod
 
 # ── their database ───────────────────────────────────────────────────────────
 export IRPILOT_DB_HOST=localhost
@@ -25,6 +28,11 @@ export IRPILOT_DATASET_DIR="$IRPILOT_GNN_ROOT/data_cris/dataset_v13"
 #   forecast_read, forecast_latest
 # Leave blank to use the default search_path.
 export IRPILOT_WRITE_SCHEMA=data
+
+# Rename any of ours the same way. The forecast table is called forecast_output:
+export IRPILOT_OUT_FORECAST=forecast_output
+# export IRPILOT_OUT_MODEL_STATE=...
+# export IRPILOT_OUT_STATION_REF=...
 
 # ── WHERE WE READ FROM ───────────────────────────────────────────────────────
 # One line per table, so each can sit in whichever schema it actually lives in.

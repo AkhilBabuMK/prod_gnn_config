@@ -87,13 +87,25 @@ class RunLock:
         return f"pid {pid} ({name or 'unnamed'}) since {since:%H:%M:%S}"
 
     def release(self) -> None:
-        if not self.held:
-            return
-        with self.conn.cursor() as cur:
-            cur.execute("SELECT pg_advisory_unlock(%s, %s)",
-                        (_NAMESPACE, _key(self.scope)))
-        self.conn.commit()
-        self.held = False
+        """Drop the lock AND close the connection that held it.
+
+        The connection is the lock's lifetime, so leaving it open leaks a
+        backend on every run. Postgres has a hard connection limit and reaching
+        it locks everyone out of the database, not just us — so this closes even
+        when the lock was never acquired.
+        """
+        try:
+            if self.held:
+                with self.conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s, %s)",
+                                (_NAMESPACE, _key(self.scope)))
+                self.conn.commit()
+                self.held = False
+        finally:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
     def __enter__(self):
         self.acquire()

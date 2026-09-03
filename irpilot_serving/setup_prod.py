@@ -2,7 +2,7 @@
 """
 ONE-COMMAND PRODUCTION SETUP.
 
-    export IRPILOT_SCHEMA=prod
+    export IRPILOT_PROFILE=prod
     export IRPILOT_DB_HOST=...  IRPILOT_DB_NAME=...
     export IRPILOT_DB_USER=...  IRPILOT_DB_PASSWORD=...
     export IRPILOT_GNN_ROOT=/opt/irpilot/jabalpur_scenario_gnn
@@ -63,8 +63,24 @@ CREATE TABLE IF NOT EXISTS {forecast} (
     lo80           REAL,
     hi80           REAL,
     model_version  TEXT,
+    -- Already inside instance_id ("<train>_<corridor date>"), split out so a
+    -- consumer can filter by train or day without parsing a string.
+    train_number   VARCHAR(20),
+    start_date     DATE,
+    station_code   VARCHAR(12),
+    -- Left for another team to fill. We create the column so their writer has
+    -- somewhere to put it, and never touch the value.
+    typical_runtime REAL,
     PRIMARY KEY (issued_at, instance_id, station_id)
 );
+
+-- The table may already exist from an earlier version, or have been created by
+-- hand. ADD COLUMN IF NOT EXISTS brings it up to date without dropping it, so
+-- no forecast history is lost to a schema change.
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS train_number    VARCHAR(20);
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS start_date      DATE;
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS station_code    VARCHAR(12);
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS typical_runtime REAL;
 CREATE INDEX IF NOT EXISTS ix_forecast_issued ON {forecast} (issued_at DESC);
 
 CREATE TABLE IF NOT EXISTS {infra_topology} (
@@ -91,9 +107,11 @@ DROP VIEW IF EXISTS {forecast_read};
 CREATE VIEW {forecast_read} AS
 SELECT f.issued_at,
        f.instance_id,
-       split_part(f.instance_id, '_', 1)                AS train_number,
-       r.station_code,
+       f.train_number,
+       f.start_date,
+       COALESCE(f.station_code, r.station_code)         AS station_code,
        r.station_name,
+       f.typical_runtime,
        f.hop                                            AS stops_ahead,
        f.lead_min                                       AS minutes_ahead,
        f.issued_at + (f.lead_min * INTERVAL '1 minute') AS predicted_arrival,
@@ -126,15 +144,15 @@ def check(name, fn):
 
 def main() -> int:
     print("=" * 78)
-    print(f"IRPILOT PRODUCTION SETUP   profile: {config.SCHEMA}")
+    print(f"IRPILOT PRODUCTION SETUP   profile: {config.PROFILE}")
     print(f"  database {config.DB['user']}@{config.DB['host']}:"
           f"{config.DB['port']}/{config.DB['dbname']}")
     print("=" * 78)
 
-    if config.SCHEMA != "prod":
+    if config.PROFILE != "prod":
         print()
-        print("  NOTE: IRPILOT_SCHEMA is not 'prod', so the table names checked")
-        print("  below are the simulation ones. Set IRPILOT_SCHEMA=prod.")
+        print("  NOTE: IRPILOT_PROFILE is not 'prod', so the table names checked")
+        print("  below are the simulation ones. Set IRPILOT_PROFILE=prod.")
 
     conn = psycopg2.connect(**config.DB)
     conn.autocommit = True

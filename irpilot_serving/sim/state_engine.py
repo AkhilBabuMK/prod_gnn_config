@@ -70,10 +70,24 @@ class StateEngine:
         ck = torch.load(config.CHECKPOINT, map_location="cpu",
                         weights_only=False)
         self.ck_sha = _sha(config.CHECKPOINT)
+        # Stamped on every forecast row. Derived from the checkpoint actually
+        # loaded, never written by hand: this was hardcoded to "v13b_ep18"
+        # while the file being loaded was model_v13a_epoch22.pt, so every row
+        # in the forecast table named a model that had not produced it. A
+        # version label that can disagree with the weights is worse than none.
+        self.model_version = f"{Path(config.CHECKPOINT).stem}:{self.ck_sha[:8]}"
+
         match_checkpoint_features(ck["config"])
 
         topo = json.loads(Path(config.TOPOLOGY).read_text(encoding="utf-8"))
         BD._init_topology(topo)
+
+        # station_id -> station CODE, so a forecast row identifies the station
+        # the way the railway does rather than only by our internal index.
+        # Taken from the topology just loaded — the same document station_ref
+        # is populated from, so the two cannot disagree.
+        self.station_code = {int(v["station_id"]): v["code"]
+                             for v in topo["stations"].values()}
         BD.HONEST_STANDING_DELAY = bool(ck.get("honest_standing_delay", False))
 
         # CrisDataset needs a day-file directory to bootstrap its feature
@@ -354,13 +368,25 @@ class StateEngine:
 
     def restore_state(self) -> dt.datetime | None:
         """Load the newest checkpoint. Refuses a checkpoint from other weights."""
-        with self.conn.cursor() as cur:
-            cur.execute("""SELECT tick_ts, station_memory, service_memory,
-                                  section_memory, station_state, prev_delay,
-                                  checkpoint_sha
-                             FROM {ms} ORDER BY tick_ts DESC LIMIT 1""".format(
-                                 ms=config.OUT["model_state"]))
-            r = cur.fetchone()
+        ms = config.OUT["model_state"]
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""SELECT tick_ts, station_memory, service_memory,
+                                      section_memory, station_state, prev_delay,
+                                      checkpoint_sha
+                                 FROM {ms} ORDER BY tick_ts DESC LIMIT 1""".format(
+                                     ms=ms))
+                r = cur.fetchone()
+        except psycopg2.errors.UndefinedTable:
+            # No checkpoint table yet. That is the ordinary state of a database
+            # setup_prod.py has not been run against, and having nothing to
+            # restore is not an error — a cold start is exactly what a first
+            # run should do. Say so plainly instead of dying at boot.
+            self.conn.rollback()
+            print(f"  {ms} does not exist — cold start."
+                  f"  Run setup_prod.py to create it, or the memory will not"
+                  f" survive a restart.")
+            return None
         if not r:
             return None
         ts, sm, vm, cm, st, pd_, sha = r
@@ -431,14 +457,22 @@ class StateEngine:
                     continue
                 if arr > horizon_end:                   # beyond the 4 h horizon
                     break
-                recs.append((issued_at, iid, int(s["station"]), k - k0,
+                sid = int(s["station"])
+                # train_number and start_date are already inside instance_id
+                # ("<train>_<corridor date>"), but a consumer should not have to
+                # split a string to filter by train or day. Split it once here.
+                train_no, _, start_date = iid.partition("_")
+                recs.append((issued_at, iid, sid, k - k0,
                              float(arr) - t0, float(arr) - float(sa),
-                             None, None, "v13b_ep18"))
+                             None, None, self.model_version,
+                             train_no, start_date,
+                             self.station_code.get(sid)))
         with self.conn.cursor() as cur:
             psycopg2.extras.execute_values(cur, """
                 INSERT INTO {fc} (issued_at, instance_id, station_id, hop,
                                       lead_min, pred_delay_min, lo80, hi80,
-                                      model_version)
+                                      model_version,
+                                      train_number, start_date, station_code)
                 VALUES %s
                 ON CONFLICT (issued_at, instance_id, station_id) DO NOTHING
             """.format(fc=config.OUT["forecast"]), recs)
