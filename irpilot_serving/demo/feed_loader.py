@@ -46,7 +46,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import psycopg2
 import config
 
-TABLE = "demo_gnn_input_table"
+# Qualified with the same write schema as everything else we create, so the
+# demo tables land beside forecast_output rather than wherever search_path
+# happens to point on the machine this is run from. Nothing of theirs is ever
+# written — these two are ours, created here and dropped on the next run.
+TABLE = config.out("demo_gnn_input_table")
+
+# Where the day's truth is read from. Normally the local main_table; with
+# --day-file, a staging table filled from a shipped CSV. Everything downstream
+# is identical, so the file path and the database path cannot drift apart.
+SOURCE = "main_table"
+STAGE = config.out("demo_source_day")
 
 DDL = f"""
 DROP TABLE IF EXISTS {TABLE};
@@ -84,7 +94,7 @@ SELECT ltrim(train_number,'0'), train_date::date, serial_number, station_code,
        train_destination_station, wtt_stop_flag, ptt_stoppage_flag,
        traffic_allowance_seconds, engineering_allowance_seconds,
        distance_from_source_km, now()
-  FROM main_table
+  FROM {{source}}
 """
 
 REVEAL = f"""
@@ -92,13 +102,75 @@ UPDATE {TABLE} d
    SET actual_arrival_time   = m.actual_arrival_time,
        actual_departure_time = m.actual_departure_time,
        arrival_time          = now()
-  FROM main_table m
+  FROM {{source}} m
  WHERE d.train_number  = ltrim(m.train_number,'0')
    AND d.train_date    = m.train_date::date
    AND d.serial_number = m.serial_number
    AND GREATEST(m.actual_arrival_time, m.actual_departure_time) >  %s
    AND GREATEST(m.actual_arrival_time, m.actual_departure_time) <= %s
 """
+
+
+def _stage_day_file(cur, path: str) -> str:
+    """Load a shipped day file into a staging table and return its name.
+
+    The file holds one corridor day exactly as the journey builder wants it —
+    booked times and observed times together, one row per stop. Loading it into
+    a table rather than reading it in Python means the reveal logic below is
+    the SAME SQL for a shipped file as for a live table, so the demo path and
+    the production path cannot quietly diverge.
+    """
+    import csv
+    import gzip
+    import io
+
+    src = Path(path)
+    if not src.exists():
+        raise SystemExit(f"day file not found: {src}")
+
+    # Plain CSV normally; .gz still accepted so an older export keeps working.
+    opener = gzip.open if src.suffix == ".gz" else open
+    with opener(src, "rt", encoding="utf-8", newline="") as fh:
+        rows = list(csv.reader(fh))
+    header, body = rows[0], rows[1:]
+    if not body:
+        raise SystemExit(f"day file has no rows: {src}")
+
+    cur.execute(f"DROP TABLE IF EXISTS {STAGE}")
+    cur.execute(f"""
+        CREATE TABLE {STAGE} (
+            train_number                  VARCHAR,
+            train_date                    VARCHAR,
+            serial_number                 NUMERIC,
+            station_code                  VARCHAR,
+            scheduled_arrival_time        TIMESTAMP,
+            scheduled_departure_time      TIMESTAMP,
+            actual_arrival_time           TIMESTAMP,
+            actual_departure_time         TIMESTAMP,
+            train_type                    VARCHAR,
+            train_sub_type                VARCHAR,
+            train_source_station          VARCHAR,
+            train_destination_station     VARCHAR,
+            wtt_stop_flag                 NUMERIC,
+            ptt_stoppage_flag             NUMERIC,
+            traffic_allowance_seconds     NUMERIC,
+            engineering_allowance_seconds NUMERIC,
+            distance_from_source_km       NUMERIC)""")
+
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    for r in body:
+        w.writerow(r)
+    buf.seek(0)
+    cur.copy_expert(
+        f"COPY {STAGE} ({', '.join(header)}) FROM STDIN WITH (FORMAT csv, NULL '')",
+        buf)
+
+    cur.execute(f"SELECT count(*), count(actual_arrival_time), "
+                f"min(train_date), max(train_date) FROM {STAGE}")
+    n, obs, lo, hi = cur.fetchone()
+    print(f"  day file {src.name}: {n:,} stops, {obs:,} observed, dates {lo}..{hi}")
+    return STAGE
 
 
 def main() -> int:
@@ -112,6 +184,11 @@ def main() -> int:
                     help="September minutes per real minute (1 = real time)")
     ap.add_argument("--every", type=float, default=5.0,
                     help="real minutes between pushes")
+    ap.add_argument("--day-file",
+                    help="a .csv from export_demo_days.py. Use this on a "
+                         "machine whose own train tables cannot be trusted: "
+                         "the file becomes the train feed, and every other "
+                         "table is still read from the database as normal.")
     args = ap.parse_args()
 
     day = dt.date.fromisoformat(args.date)
@@ -132,12 +209,16 @@ def main() -> int:
           f"= {step_min:g} September min | {cycles} pushes")
     print("=" * 74)
 
+    source = SOURCE
+    if args.day_file:
+        source = _stage_day_file(cur, args.day_file)
+
     cur.execute(DDL)
-    cur.execute(TIMETABLE)
+    cur.execute(TIMETABLE.format(source=source))
     print(f"  timetable loaded: {cur.rowcount:,} stops, actuals withheld")
 
     # everything before the start time is already history by the time we begin
-    cur.execute(REVEAL, (dt.datetime(2000, 1, 1), start))
+    cur.execute(REVEAL.format(source=source), (dt.datetime(2000,1,1), start))
     print(f"  warm start: {cur.rowcount:,} stops already reported "
           f"up to September {args.frm}")
     print()
@@ -145,7 +226,7 @@ def main() -> int:
     for i in range(cycles):
         lo = start + dt.timedelta(minutes=step_min * i)
         hi = lo + dt.timedelta(minutes=step_min)
-        cur.execute(REVEAL, (lo, hi))
+        cur.execute(REVEAL.format(source=source), (lo, hi))
         print(f"  [{dt.datetime.now():%H:%M:%S}] +{cur.rowcount:5d} stops "
               f"-> September {hi:%H:%M}", flush=True)
         if i < cycles - 1:
