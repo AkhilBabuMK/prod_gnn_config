@@ -458,21 +458,60 @@ class StateEngine:
                 if arr > horizon_end:                   # beyond the 4 h horizon
                     break
                 sid = int(s["station"])
-                # train_number and start_date are already inside instance_id
-                # ("<train>_<corridor date>"), but a consumer should not have to
-                # split a string to filter by train or day. Split it once here.
                 train_no, _, start_date = iid.partition("_")
-                recs.append((issued_at, iid, sid, k - k0,
-                             float(arr) - t0, float(arr) - float(sa),
-                             None, None, self.model_version,
-                             train_no, start_date,
-                             self.station_code.get(sid)))
+                curr_code = s.get("station_code") or self.station_code.get(sid)
+
+                # Derive the requested additional fields:
+                # 1. block_section: section from previous stop to current stop
+                prev_s = inst["stops"][k - 1]
+                prev_code = prev_s.get("station_code") or self.station_code.get(int(prev_s["station"]))
+                block_sec = f"{prev_code}-{curr_code}" if (prev_code and curr_code) else None
+
+                # 2. minutes_from_start: scheduled minutes offset from midnight of start_date
+                minutes_from_start = round(float(sa), 1)
+
+                # 3. scheduled_arrival & actual_arrival: absolute timestamps
+                try:
+                    d_part = dt.date.fromisoformat(start_date)
+                    if issued_at.tzinfo:
+                        base_midnight = dt.datetime(d_part.year, d_part.month, d_part.day, tzinfo=issued_at.tzinfo)
+                    else:
+                        base_midnight = dt.datetime(d_part.year, d_part.month, d_part.day)
+                    sched_arr_ts = base_midnight + dt.timedelta(minutes=float(sa))
+                except Exception:
+                    sched_arr_ts = None
+                    base_midnight = None
+
+                act_arr_ts = None
+                if base_midnight is not None and truth:
+                    truth_stops = truth.get("stops", [])
+                    truth_stop = truth_stops[k] if k < len(truth_stops) else None
+                    if truth_stop and truth_stop.get("has_actual"):
+                        t_act = truth_stop.get("actual_arr_abs")
+                        if t_act is not None:
+                            act_arr_ts = base_midnight + dt.timedelta(minutes=float(t_act))
+
+                recs.append((
+                    issued_at, iid, sid, k - k0,
+                    round(float(arr) - t0, 1),
+                    round(float(arr) - float(sa), 1),
+                    None, None, self.model_version,
+                    train_no, start_date, curr_code,
+                    block_sec,
+                    minutes_from_start,
+                    sched_arr_ts,
+                    act_arr_ts
+                ))
         with self.conn.cursor() as cur:
             psycopg2.extras.execute_values(cur, """
-                INSERT INTO {fc} (issued_at, instance_id, station_id, hop,
-                                      lead_min, pred_delay_min, lo80, hi80,
-                                      model_version,
-                                      train_number, start_date, station_code)
+                INSERT INTO {fc} (
+                    issued_at, instance_id, station_id, hop,
+                    lead_min, pred_delay_min, lo80, hi80,
+                    model_version,
+                    train_number, start_date, station_code,
+                    block_section, minutes_from_start,
+                    scheduled_arrival, actual_arrival
+                )
                 VALUES %s
                 ON CONFLICT (issued_at, instance_id, station_id) DO NOTHING
             """.format(fc=config.OUT["forecast"]), recs)

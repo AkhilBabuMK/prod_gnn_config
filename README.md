@@ -48,8 +48,8 @@ it checkpoints its memory every 3 minutes and restores on boot.
 
 ## 5. Read the forecasts
 
-    SELECT train_number, station_code, station_name,
-           predicted_arrival, predicted_delay_min, minutes_ahead
+    SELECT train_number, start_date, station_code, block_section,
+           pred_delay_min, lead_min, scheduled_arrival, predicted_arrival, actual_arrival
       FROM forecast_latest
      ORDER BY predicted_arrival;
 

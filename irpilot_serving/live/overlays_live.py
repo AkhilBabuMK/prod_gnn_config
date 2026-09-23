@@ -63,7 +63,7 @@ config.bootstrap_gnn_path()
 from cris_pipeline.config import CORRIDOR                        # noqa: E402
 from cris_pipeline.overlays import (                             # noqa: E402
     FreightOverlay, DisruptionOverlay, _add_interval, _sec_key,
-    _parse_section_string, CODE_TO_ID,
+    _parse_section_string, _expand_section, CODE_TO_ID,
 )
 
 
@@ -345,7 +345,12 @@ class LiveDisruptionOverlay(DisruptionOverlay):
             spd = float(spd)
             sec = _parse_section_string(sec_s)
             if sec is not None:
-                apply(_sec_key(CODE_TO_ID[sec[0]], CODE_TO_ID[sec[1]]), spd)
+                # Aggregate sections spanning a block post expand onto the two
+                # real sections; see cris_pipeline.overlays._expand_section.
+                # Maintenance and failures inherit this via DisruptionOverlay
+                # ._add -- only TSR builds its key directly, so it needs this.
+                for a_code, b_code in _expand_section(*sec):
+                    apply(_sec_key(CODE_TO_ID[a_code], CODE_TO_ID[b_code]), spd)
                 continue
             code = str(sec_s).strip().upper()
             if code in CORRIDOR and section_pairs:

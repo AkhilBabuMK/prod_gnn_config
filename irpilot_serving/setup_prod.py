@@ -54,33 +54,35 @@ CREATE TABLE IF NOT EXISTS {model_state} (
 CREATE INDEX IF NOT EXISTS ix_model_state_created ON {model_state} (created_at DESC);
 
 CREATE TABLE IF NOT EXISTS {forecast} (
-    issued_at      TIMESTAMPTZ NOT NULL,
-    instance_id    TEXT        NOT NULL,
-    station_id     INTEGER     NOT NULL,
-    hop            INTEGER,
-    lead_min       REAL,
-    pred_delay_min REAL,
-    lo80           REAL,
-    hi80           REAL,
-    model_version  TEXT,
-    -- Already inside instance_id ("<train>_<corridor date>"), split out so a
-    -- consumer can filter by train or day without parsing a string.
-    train_number   VARCHAR(20),
-    start_date     DATE,
-    station_code   VARCHAR(12),
-    -- Left for another team to fill. We create the column so their writer has
-    -- somewhere to put it, and never touch the value.
-    typical_runtime REAL,
+    issued_at          TIMESTAMPTZ NOT NULL,
+    instance_id        TEXT        NOT NULL,
+    station_id         INTEGER     NOT NULL,
+    hop                INTEGER,
+    lead_min           REAL,
+    pred_delay_min     REAL,
+    lo80               REAL,
+    hi80               REAL,
+    model_version      TEXT,
+    train_number       VARCHAR(20),
+    start_date         DATE,
+    station_code       VARCHAR(12),
+    block_section      VARCHAR(30),
+    minutes_from_start REAL,
+    scheduled_arrival  TIMESTAMPTZ,
+    actual_arrival     TIMESTAMPTZ,
     PRIMARY KEY (issued_at, instance_id, station_id)
 );
 
 -- The table may already exist from an earlier version, or have been created by
 -- hand. ADD COLUMN IF NOT EXISTS brings it up to date without dropping it, so
 -- no forecast history is lost to a schema change.
-ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS train_number    VARCHAR(20);
-ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS start_date      DATE;
-ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS station_code    VARCHAR(12);
-ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS typical_runtime REAL;
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS train_number       VARCHAR(20);
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS start_date         DATE;
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS station_code       VARCHAR(12);
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS block_section      VARCHAR(30);
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS minutes_from_start REAL;
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS scheduled_arrival  TIMESTAMPTZ;
+ALTER TABLE {forecast} ADD COLUMN IF NOT EXISTS actual_arrival     TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS ix_forecast_issued ON {forecast} (issued_at DESC);
 
 CREATE TABLE IF NOT EXISTS {infra_topology} (
@@ -105,27 +107,37 @@ DROP VIEW IF EXISTS {forecast_latest};
 DROP VIEW IF EXISTS {forecast_read};
 
 CREATE VIEW {forecast_read} AS
-SELECT f.issued_at,
-       f.instance_id,
-       f.train_number,
+SELECT f.train_number,
        f.start_date,
        COALESCE(f.station_code, r.station_code)         AS station_code,
-       r.station_name,
-       f.typical_runtime,
-       f.hop                                            AS stops_ahead,
-       f.lead_min                                       AS minutes_ahead,
-       f.issued_at + (f.lead_min * INTERVAL '1 minute') AS predicted_arrival,
-       round(f.pred_delay_min::numeric, 1)              AS predicted_delay_min,
-       -- A predicted arrival BEFORE the issue time means the train is already
-       -- past the moment we expect it and has not reported.
-       (f.lead_min < 0)                                 AS is_overdue,
-       f.lo80, f.hi80, f.model_version
+       f.block_section,
+       round(f.pred_delay_min::numeric, 1)              AS pred_delay_min,
+       round(f.lead_min::numeric, 1)                    AS lead_min,
+       f.scheduled_arrival,
+       COALESCE(
+           f.scheduled_arrival + (f.pred_delay_min * INTERVAL '1 minute'),
+           f.issued_at + (f.lead_min * INTERVAL '1 minute')
+       )                                                AS predicted_arrival,
+       f.actual_arrival
   FROM {forecast} f
   LEFT JOIN {station_ref} r ON r.station_id = f.station_id;
 
 CREATE VIEW {forecast_latest} AS
-SELECT * FROM {forecast_read}
- WHERE issued_at = (SELECT max(issued_at) FROM {forecast});
+SELECT f.train_number,
+       f.start_date,
+       COALESCE(f.station_code, r.station_code)         AS station_code,
+       f.block_section,
+       round(f.pred_delay_min::numeric, 1)              AS pred_delay_min,
+       round(f.lead_min::numeric, 1)                    AS lead_min,
+       f.scheduled_arrival,
+       COALESCE(
+           f.scheduled_arrival + (f.pred_delay_min * INTERVAL '1 minute'),
+           f.issued_at + (f.lead_min * INTERVAL '1 minute')
+       )                                                AS predicted_arrival,
+       f.actual_arrival
+  FROM {forecast} f
+  LEFT JOIN {station_ref} r ON r.station_id = f.station_id
+ WHERE f.issued_at = (SELECT max(issued_at) FROM {forecast});
 """
 
 _ok = _bad = 0
