@@ -60,11 +60,24 @@ import config                                                    # noqa: E402
 
 config.bootstrap_gnn_path()
 
-from cris_pipeline.config import CORRIDOR                        # noqa: E402
-from cris_pipeline.overlays import (                             # noqa: E402
+from cris_pipeline.config import CORRIDOR, DUPLICATE_SECTIONS, CORRIDOR_ORDER  # noqa: E402
+from cris_pipeline.overlays import (                                                # noqa: E402
     FreightOverlay, DisruptionOverlay, _add_interval, _sec_key,
-    _parse_section_string, _expand_section, CODE_TO_ID,
+    _parse_section_string, CODE_TO_ID,
 )
+
+try:
+    from cris_pipeline.overlays import _expand_section
+except ImportError:
+    def _expand_section(a: str, b: str) -> list[tuple[str, str]]:
+        """Fallback: resolve aggregate section (e.g. BUU-UDR) onto topology halves."""
+        if frozenset((a, b)) not in DUPLICATE_SECTIONS:
+            return [(a, b)]
+        i, j = CORRIDOR_ORDER.index(a), CORRIDOR_ORDER.index(b)
+        if i > j:
+            i, j = j, i
+        return [(CORRIDOR_ORDER[k], CORRIDOR_ORDER[k + 1]) for k in range(i, j)]
+
 
 
 # ── How long may an OPEN event stay open? ────────────────────────────────────

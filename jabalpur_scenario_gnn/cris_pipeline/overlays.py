@@ -31,7 +31,7 @@ import pandas as pd
 
 from .config import (
     GOODS_CSV, MAINT_CSV, ASSET_CSV, TSR_CSV, DETENTION_CSV,
-    CORRIDOR, CORRIDOR_ORDER,
+    CORRIDOR, CORRIDOR_ORDER, DUPLICATE_SECTIONS,
 )
 
 CODE_TO_ID = {c: i for i, c in enumerate(CORRIDOR_ORDER)}
@@ -90,6 +90,108 @@ def _parse_section_string(s) -> tuple[str, str] | None:
     if a in CORRIDOR and b in CORRIDOR:
         return a, b
     return None
+
+
+def _expand_section(a: str, b: str) -> list[tuple[str, str]]:
+    """Resolve an aggregate section onto the sections the topology actually has.
+
+    CRIS names the track through a block post two ways — the subdivided legs
+    ('BUU-GNWA' + 'GNWA-UDR') and one aggregate spanning it ('BUU-UDR') — and
+    `config.DUPLICATE_SECTIONS` documents the exact distance arithmetic proving
+    they are the same rails. `build_topology` keeps the subdivision and DROPS
+    the aggregate, so the graph has no BUU-UDR edge.
+
+    This module did not know that. `_parse_section_string` accepts 'BUU-UDR'
+    (both ends are on the corridor), `_sec_key` turns it into a key no journey
+    ever queries, and the event is stored in a dict nobody reads: no error, no
+    warning, no counter. Measured on the current extract, that silently
+    discarded 101 of 435 corridor disruptions — 23% — including 80 maintenance
+    blocks totalling 7,417 minutes of blocked track, one of them a 163-minute
+    ENGG-OPENLINE closure on 2025-09-10.
+
+    It is the aggregate form that operational staff actually write: across
+    asset_failure, maintenance, TSR and goods running, the aggregate appears
+    2,242 times against 1 for the subdivision. So this is the normal case.
+
+    Expansion is safe because a block post has no platform and no loop — a
+    train cannot be held or turned back there — so a disruption anywhere
+    between the two real stations blocks the whole stretch, hence both halves.
+
+    Pairs that are not aggregates are returned unchanged.
+    """
+    if frozenset((a, b)) not in DUPLICATE_SECTIONS:
+        return [(a, b)]
+    i, j = CORRIDOR_ORDER.index(a), CORRIDOR_ORDER.index(b)
+    if i > j:
+        i, j = j, i
+    return [(CORRIDOR_ORDER[k], CORRIDOR_ORDER[k + 1]) for k in range(i, j)]
+
+
+_SECTION_KM: dict[tuple[str, str], float] = {}
+
+
+def _section_km(a: str, b: str) -> float:
+    """distance_km for one real section, from the built topology.
+
+    Loaded once and cached. Falls back to 1.0 (equal weighting) if the topology
+    has not been built yet, so importing this module never depends on it.
+    """
+    global _SECTION_KM
+    if not _SECTION_KM:
+        try:
+            import json
+            from .config import TOPOLOGY_PATH
+            topo = json.load(open(TOPOLOGY_PATH, encoding="utf-8"))
+            for sec in topo["sections"].values():
+                km = float(sec.get("distance_km") or 0.0) or 1.0
+                _SECTION_KM[(sec["from_code"], sec["to_code"])] = km
+                _SECTION_KM[(sec["to_code"], sec["from_code"])] = km
+        except Exception:                                       # pragma: no cover
+            _SECTION_KM = {"__missing__": 1.0}
+    return float(_SECTION_KM.get((a, b), 1.0))
+
+
+def _split_leg(a: str, b: str, start, end) -> list[tuple[tuple[str, str], object, object]]:
+    """Cut one movement across an aggregate section into its real sections.
+
+    Freight NEVER reports at a block post — there are zero goods rows at GNWA,
+    MDRR or SNRR — so consecutive goods stops jump 'BUU' -> 'UDR' and the leg
+    was stored under the aggregate key the topology dropped. Measured: 2,071 of
+    13,029 corridor freight legs (15.9%) landed there, and six of the twenty-one
+    real sections (BUU-GNWA, GNWA-UDR, KTES-MDRR, MDRR-NWR, NWR-SNRR, SNRR-SBD
+    — 29% of the corridor) reported ZERO freight for the whole month. A train
+    following a goods train through that stretch was told the track was clear.
+
+    Unlike a disruption, which closes the whole stretch at once, a moving train
+    occupies ONE block section at a time — that is precisely what the block post
+    is there for, so two trains can follow each other through. Giving both
+    halves the full interval would make one goods train read as two. So the
+    interval is cut in proportion to distance: 6.24 km of BUU-GNWA against
+    6.42 km of GNWA-UDR puts the boundary at 49.3% of the run.
+
+    Constant speed across the stretch is the assumption. It is the weakest part
+    of this, but the two halves of every aggregate here differ by at most 1 km,
+    so the boundary moves very little even if the train accelerates.
+
+    Ordinary sections return a single unchanged piece.
+    """
+    pieces = _expand_section(a, b)
+    if len(pieces) == 1:
+        return [(pieces[0], start, end)]
+    if pd.isna(start) or pd.isna(end) or end <= start:
+        return [(p, start, end) for p in pieces]
+    # Walk the stretch in the direction of travel, not corridor order.
+    if CORRIDOR_ORDER.index(a) > CORRIDOR_ORDER.index(b):
+        pieces = [(y, x) for x, y in reversed(pieces)]
+    kms = [_section_km(x, y) for x, y in pieces]
+    total = sum(kms) or 1.0
+    out, cursor = [], start
+    span = end - start
+    for n, (piece, km) in enumerate(zip(pieces, kms)):
+        stop = end if n == len(pieces) - 1 else cursor + span * (km / total)
+        out.append((piece, cursor, stop))
+        cursor = stop
+    return out
 
 
 # ── Freight ───────────────────────────────────────────────────────────────────
@@ -165,10 +267,20 @@ class FreightOverlay:
                 narr = nxt["arvltime"]
                 if nsid is None or pd.isna(dep) or pd.isna(narr) or narr <= dep:
                     continue
-                ov.n_legs += _add_interval(
-                    ov.section_intervals, _sec_key(sid, nsid), dep, narr)
-                # Directional: this freight is inbound to nsid until it arrives.
-                _add_interval(ov.inbound_intervals, nsid, dep, narr)
+                # A goods leg that spans a block post covers TWO real sections;
+                # see _split_leg. Ordinary legs come back as a single unchanged
+                # piece, so this is a no-op for 84% of legs.
+                for (pa, pb), p_dep, p_arr in _split_leg(
+                        code, str(nxt["station"]), dep, narr):
+                    p_sid, p_nsid = CODE_TO_ID[pa], CODE_TO_ID[pb]
+                    ov.n_legs += _add_interval(
+                        ov.section_intervals, _sec_key(p_sid, p_nsid),
+                        p_dep, p_arr)
+                    # Directional: this freight is inbound to the station at the
+                    # far end of the piece it is on, until it gets there. Before
+                    # the split, a block post never appeared as a destination, so
+                    # a train approaching one was told no freight was ahead.
+                    _add_interval(ov.inbound_intervals, p_nsid, p_dep, p_arr)
 
         return ov
 
@@ -228,12 +340,17 @@ class DisruptionOverlay:
             return
         if pd.isna(end) or end <= start:
             end = start + pd.Timedelta(minutes=30)
-        a, b = CODE_TO_ID[sec[0]], CODE_TO_ID[sec[1]]
-        # Split per day, same as freight. No disruption in the current extract
-        # crosses midnight, but a maintenance block starting 23:00 is entirely
-        # plausible and would otherwise stop applying at 00:00 while the track
-        # was still closed.
-        _add_interval(self.events, _sec_key(a, b), start, end, severity)
+        # An aggregate section spanning a block post becomes the two real
+        # sections it is made of; anything else passes through untouched. See
+        # _expand_section -- without this the event lands on a key the topology
+        # dropped and is silently never read.
+        for a_code, b_code in _expand_section(sec[0], sec[1]):
+            a, b = CODE_TO_ID[a_code], CODE_TO_ID[b_code]
+            # Split per day, same as freight. No disruption in the current
+            # extract crosses midnight, but a maintenance block starting 23:00
+            # is entirely plausible and would otherwise stop applying at 00:00
+            # while the track was still closed.
+            _add_interval(self.events, _sec_key(a, b), start, end, severity)
 
     def _load_maintenance(self) -> None:
         try:
@@ -307,7 +424,8 @@ class DisruptionOverlay:
 
             sec = _parse_section_string(r.Block_Section)
             if sec is not None:
-                apply(_sec_key(CODE_TO_ID[sec[0]], CODE_TO_ID[sec[1]]), spd)
+                for a_code, b_code in _expand_section(*sec):
+                    apply(_sec_key(CODE_TO_ID[a_code], CODE_TO_ID[b_code]), spd)
                 continue
 
             code = str(r.Block_Section).strip().upper()
